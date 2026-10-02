@@ -4,7 +4,7 @@ Run with: uvicorn server:app --host 0.0.0.0 --port 8000
 
 Deployment settings (all optional, environment variables):
 
-- ``API_KEY``: when set, the POST endpoints require an ``X-API-Key`` header with this value.
+- ``OPENPRONOUNCE_API_KEY`` (or legacy ``API_KEY``): when set, the POST endpoints require an ``X-API-Key`` header with this value.
 - ``OPENPRONOUNCE_LANGUAGES``: comma-separated language codes served (default ``en``).
 - ``OPENPRONOUNCE_PRELOAD``: load the models at startup (default ``1``); ``/ready`` answers 503 until done.
 - ``OPENPRONOUNCE_MAX_CONCURRENCY``: simultaneous analyses (default ``2``); extra requests wait, then get 503.
@@ -32,7 +32,7 @@ logger = logging.getLogger("openpronounce.server")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-API_KEY = os.environ.get("API_KEY", "")
+API_KEY = os.environ.get("OPENPRONOUNCE_API_KEY") or os.environ.get("API_KEY", "")
 ENABLED_LANGUAGES = [c.strip() for c in os.environ.get("OPENPRONOUNCE_LANGUAGES", "en").split(",") if c.strip()]
 PRELOAD = os.environ.get("OPENPRONOUNCE_PRELOAD", "1") not in ("0", "false", "no", "off")
 MAX_CONCURRENCY = max(1, int(os.environ.get("OPENPRONOUNCE_MAX_CONCURRENCY", "2")))
@@ -71,7 +71,7 @@ def _preload_models():
 @asynccontextmanager
 async def lifespan(app):
     if not API_KEY:
-        logger.warning("API_KEY is not set: the API is open to everyone")
+        logger.warning("OPENPRONOUNCE_API_KEY is not set: the API is open to everyone")
     _configure_threads()
     if PRELOAD:
         # In a thread so the server answers /health while the models load.
@@ -92,7 +92,7 @@ templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
 
 
 def require_api_key(key: str = Depends(_api_key_header)):
-    """Reject the request unless it carries the configured ``X-API-Key`` (no-op when ``API_KEY`` is unset)."""
+    """Reject the request unless it carries the configured ``X-API-Key`` (no-op when no API key is configured)."""
     if API_KEY and not (key and hmac.compare_digest(key.encode(), API_KEY.encode())):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
