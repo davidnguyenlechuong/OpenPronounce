@@ -114,6 +114,30 @@
 
     // ---------------------------------------------------------------- languages
 
+    // fetch() that sends the API key (kept in localStorage); asks for it when the server answers 401.
+    const API_KEY_STORAGE_KEY = 'openpronounce.apiKey';
+
+    function storedApiKey() {
+        try { return localStorage.getItem(API_KEY_STORAGE_KEY) || ''; } catch (err) { return ''; }
+    }
+
+    async function apiFetch(url, options = {}) {
+        const send = key => fetch(url, { ...options, headers: { ...(options.headers || {}), ...(key ? { 'X-API-Key': key } : {}) } });
+        let response = await send(storedApiKey());
+        if (response.status === 401) {
+            const key = window.prompt('API key required:');
+            if (key) {
+                try { localStorage.setItem(API_KEY_STORAGE_KEY, key.trim()); } catch (err) { /* storage unavailable */ }
+                response = await send(key.trim());
+            }
+            if (response.status === 401) {
+                try { localStorage.removeItem(API_KEY_STORAGE_KEY); } catch (err) { /* ignore */ }
+                throw new Error('Invalid API key.');
+            }
+        }
+        return response;
+    }
+
     async function loadLanguages() {
         try {
             const response = await fetch('/languages');
@@ -317,13 +341,13 @@
         formData.append('lang', state.lang);
 
         try {
-            const response = await fetch('/pronunciation', { method: 'POST', body: formData });
+            const response = await apiFetch('/pronunciation', { method: 'POST', body: formData });
             if (!response.ok) {
                 let detail = '';
                 try {
                     detail = (await response.json()).detail || '';
                 } catch (err) { /* not JSON */ }
-                throw new Error(response.status === 422 && detail
+                throw new Error([413, 422, 503].includes(response.status) && detail
                     ? detail
                     : 'The server could not analyze this recording. Try again in a moment.');
             }
@@ -634,7 +658,7 @@
             const formData = new FormData();
             formData.append('text', expectedText());
             formData.append('lang', state.lang);
-            const response = await fetch('/tts', { method: 'POST', body: formData });
+            const response = await apiFetch('/tts', { method: 'POST', body: formData });
             if (!response.ok) {
                 throw new Error('tts failed');
             }

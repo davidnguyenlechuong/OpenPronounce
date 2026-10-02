@@ -20,7 +20,8 @@ RUN apt-get update \
 WORKDIR /app
 
 # CPU wheels of torch are much smaller than the default CUDA ones.
-RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install -U pip \
+    && pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 COPY pyproject.toml README.md ./
 COPY openpronounce ./openpronounce
