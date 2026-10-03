@@ -137,6 +137,77 @@ class TestDecodeWithConfidence(unittest.TestCase):
         self.assertEqual(phones.normalize_phones(["th", "ai5", "ɔːɹ", "ɜː"]), ["t", "aɪ", "oɹ", "ɚ"])
 
 
+class TestWordTimestamps(unittest.TestCase):
+    """Word start/end come from the frames the phones were decoded from."""
+
+    VOCAB = ("<pad>", "h", "aʊ", "u", "z", "t")
+    FRAME = 0.02
+
+    def recognition(self, segments, n_frames):
+        """``segments`` is ``[(token, first_frame, last_frame_inclusive)]`` on a blank background."""
+        lp = np.full((n_frames, len(self.VOCAB)), 1e-6)
+        lp[:, 0] = 0.99
+        for token, first, last in segments:
+            lp[first:last + 1, :] = 1e-6
+            lp[first:last + 1, self.VOCAB.index(token)] = 0.9
+        return phones.decode_ctc(np.log(lp / lp.sum(axis=1, keepdims=True)), self.VOCAB, frame_seconds=self.FRAME)
+
+    def assert_close(self, actual, expected, frames=2):
+        self.assertAlmostEqual(actual, expected, delta=frames * self.FRAME)
+
+    def test_every_word_has_times_within_two_frames(self):
+        # "how" spoken from 0.20 s to 0.30 s, "zoo" from 0.40 s to 0.54 s, 0.70 s of audio in all
+        rec = self.recognition([("h", 10, 11), ("aʊ", 12, 14), ("z", 20, 22), ("u", 23, 26)], 35)
+        result = phones.compare_phones(rec, "how zoo")
+        words = result["words"]
+        self.assertEqual([w["word"] for w in words], ["how", "zoo"])
+        self.assertEqual([w["position"] for w in words], [0, 1])
+        self.assertEqual([w["correct"] for w in words], [True, True])
+        self.assert_close(words[0]["start"], 0.20)
+        self.assert_close(words[0]["end"], 0.30)
+        self.assert_close(words[1]["start"], 0.40)
+        self.assert_close(words[1]["end"], 0.54)
+        self.assertEqual(result["errors"], [])
+
+    def test_wrong_word_carries_times_in_errors_and_words(self):
+        # "zoo" said as "too" (t for z is a full substitution)
+        rec = self.recognition([("h", 10, 11), ("aʊ", 12, 14), ("t", 20, 22), ("u", 23, 26)], 35)
+        result = phones.compare_phones(rec, "how zoo")
+        error = result["errors"][0]
+        self.assertEqual(error["word"], "zoo")
+        self.assert_close(error["start"], 0.40)
+        self.assert_close(error["end"], 0.54)
+        timed = {w["word"]: w for w in result["words"]}
+        self.assertFalse(timed["zoo"]["correct"])
+        self.assertTrue(timed["how"]["correct"])
+        self.assertEqual((timed["zoo"]["start"], timed["zoo"]["end"]), (error["start"], error["end"]))
+
+    def test_unheard_word_gets_the_gap_between_its_neighbours(self):
+        # "how zoo how", the middle word is skipped: gap between the end of 1st how and start of 2nd
+        rec = self.recognition([("h", 10, 11), ("aʊ", 12, 14), ("h", 30, 31), ("aʊ", 32, 34)], 40)
+        words = phones.compare_phones(rec, "how zoo how")["words"]
+        self.assertEqual([w["correct"] for w in words], [True, False, True])
+        self.assert_close(words[1]["start"], 0.30)
+        self.assert_close(words[1]["end"], 0.60)
+
+    def test_plain_list_has_no_times(self):
+        result = phones.compare_phones(["h", "aʊ", "z", "u"], "how zoo")
+        self.assertTrue(all(w["start"] is None and w["end"] is None for w in result["words"]))
+
+    def test_frame_seconds_follows_model_config(self):
+        from unittest.mock import MagicMock, patch
+        model = MagicMock()
+        model.config.inputs_to_logits_ratio = 320
+        with patch.object(phones, "_load_model", return_value=(None, model)):
+            self.assertAlmostEqual(phones.frame_seconds(), 0.02)
+
+    def test_existing_error_fields_are_kept(self):
+        rec = self.recognition([("h", 10, 11), ("u", 12, 14)], 20)
+        error = phones.compare_phones(rec, "how")["errors"][0]
+        for key in ("position", "word", "expected", "actual", "actual_word", "phone_distance", "confidence", "phones"):
+            self.assertIn(key, error)
+
+
 class TestConfidenceRule(unittest.TestCase):
     """The same wrong phones flag a word or not depending on how sure the recognizer was."""
 

@@ -26,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 PHONE_MODEL_NAME = os.environ.get("OPENPRONOUNCE_PHONEME_MODEL", "facebook/wav2vec2-lv-60-espeak-cv-ft")
 SAMPLING_RATE = 16000
+# Duration of one CTC frame when it cannot be read from the model config (wav2vec2: 320 samples at 16 kHz).
+DEFAULT_FRAME_SECONDS = 0.02
 
 # Every wrong phone of a word gets an error confidence (0-1, see :func:`compare_phones`).
 # A word is reported when these confidences add up to at least this share of its phones...
@@ -172,7 +174,8 @@ class PhoneRecognition(NamedTuple):
     ``phones`` are normalized, ``confidences`` (0-1) is the peak posterior of each
     phone over the frames it was decoded from, ``spans`` the ``(start, end)`` frame
     range of each phone, ``log_posteriors`` the ``(frames, vocab)`` log posteriors of
-    the model and ``vocab`` its tokens indexed by id.
+    the model and ``vocab`` its tokens indexed by id. ``frame_seconds`` is the duration
+    of one frame, to turn frame indices into seconds.
     """
 
     phones: list
@@ -180,13 +183,15 @@ class PhoneRecognition(NamedTuple):
     spans: list
     log_posteriors: np.ndarray
     vocab: tuple
+    frame_seconds: float = DEFAULT_FRAME_SECONDS
 
 
 def _is_special(token):
     return token.startswith("<") and token.endswith(">")
 
 
-def decode_ctc(log_posteriors, vocab, blank_id=0, lang=DEFAULT_LANGUAGE, normalize=True):
+def decode_ctc(log_posteriors, vocab, blank_id=0, lang=DEFAULT_LANGUAGE, normalize=True,
+               frame_seconds=DEFAULT_FRAME_SECONDS):
     """Greedy CTC decoding of ``log_posteriors`` (frames x vocab) into a :class:`PhoneRecognition`.
 
     Repeated frames are collapsed, blanks and special tokens dropped. Each phone gets
@@ -207,13 +212,19 @@ def decode_ctc(log_posteriors, vocab, blank_id=0, lang=DEFAULT_LANGUAGE, normali
             spans.append((start, end))
         start = end
     if not normalize:
-        return PhoneRecognition(tokens, confidences, spans, log_posteriors, tuple(vocab))
+        return PhoneRecognition(tokens, confidences, spans, log_posteriors, tuple(vocab), frame_seconds)
     phones, merged_confidences, merged_spans = [], [], []
     for phone, sources in _normalize_indexed(tokens, lang):
         phones.append(phone)
         merged_confidences.append(max(confidences[i] for i in sources))
         merged_spans.append((spans[sources[0]][0], spans[sources[-1]][1]))
-    return PhoneRecognition(phones, merged_confidences, merged_spans, log_posteriors, tuple(vocab))
+    return PhoneRecognition(phones, merged_confidences, merged_spans, log_posteriors, tuple(vocab), frame_seconds)
+
+
+def frame_seconds():
+    """Duration in seconds of one frame of the phone model, from its config (conv strides / sampling rate)."""
+    _, model = _load_model()
+    return float(model.config.inputs_to_logits_ratio) / SAMPLING_RATE
 
 
 def phone_log_posteriors(audio_waveform, sampling_rate=SAMPLING_RATE):
@@ -237,7 +248,8 @@ def recognize_phones(audio_waveform, sampling_rate=SAMPLING_RATE, normalize=True
     """Recognize the phones of a 16 kHz waveform with their confidences and frame posteriors."""
     processor, _ = _load_model()
     log_posteriors = phone_log_posteriors(audio_waveform, sampling_rate)
-    return decode_ctc(log_posteriors, phone_vocab(), processor.tokenizer.pad_token_id, lang, normalize)
+    return decode_ctc(log_posteriors, phone_vocab(), processor.tokenizer.pad_token_id, lang, normalize,
+                      frame_seconds())
 
 
 def transcribe_phones(audio_waveform, sampling_rate=SAMPLING_RATE, normalize=True, lang=DEFAULT_LANGUAGE,
@@ -412,7 +424,8 @@ def _word_reports(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
     Returns one dict per word with phones: ``position``, ``word``, ``expected`` (phones),
     ``actual`` (phones heard for the word), ``distance`` (edit distance to the closest
     accepted pronunciation), ``phones`` (per-phone reports, see :func:`_phone_reports`)
-    and ``weighted_edits`` (sum of the per-phone confidences).
+    and ``weighted_edits`` (sum of the per-phone confidences), plus ``start`` and ``end``
+    (seconds in the audio, ``None`` without a recognition) of the word.
     """
     recognition, heard, _ = _as_recognition(heard_phones)
     n_frames = len(recognition.log_posteriors) if recognition is not None else 0
@@ -447,6 +460,7 @@ def _word_reports(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
             region = (recognition.spans[max(before)][0] if before else 0,
                       recognition.spans[min(after)][1] if after else n_frames)
         phone_reports = _phone_reports(candidate, actual, matched, recognition, region, lang) if distance else []
+        start, end = _word_times(recognition, matched, alignment, indices, len(expected))
         reports.append({
             "position": position,
             "word": word,
@@ -455,8 +469,31 @@ def _word_reports(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
             "distance": distance,
             "phones": phone_reports,
             "weighted_edits": sum(p["confidence"] for p in phone_reports),
+            "start": start,
+            "end": end,
         })
     return reports
+
+
+def _word_times(recognition, matched, alignment, indices, n_expected):
+    """``(start, end)`` in seconds of a word, or ``(None, None)`` without a recognition.
+
+    A word with heard phones spans their frames. A word that was not heard at all gets the
+    gap between its neighbours (empty if they touch).
+    """
+    if recognition is None:
+        return None, None
+    spans = recognition.spans
+    if matched:
+        first, last = spans[matched[0]][0], spans[matched[-1]][1]
+    else:
+        before = [j for i in range(indices[0]) for j in alignment[i]]
+        after = [j for i in range(indices[-1] + 1, n_expected) for j in alignment[i]]
+        first = spans[max(before)][1] if before else 0
+        last = spans[min(after)][0] if after else len(recognition.log_posteriors)
+        last = max(first, last)
+    seconds = recognition.frame_seconds
+    return round(first * seconds, 3), round(last * seconds, 3)
 
 
 def compare_phones(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
@@ -475,7 +512,9 @@ def compare_phones(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
     (same shape as the text-based errors: ``position``, ``word``, ``expected``,
     ``actual``, ``actual_word``, plus ``phone_distance``, ``confidence`` (0-1, how sure
     we are the word is mispronounced) and ``phones``, a per-phone list of
-    ``{expected, heard, confidence}``) and ``words_with_errors``.
+    ``{expected, heard, confidence}``, ``start``/``end`` in seconds) and ``words_with_errors``.
+    ``words`` lists every word (correct or not) as ``{position, word, start, end, correct}``;
+    ``start``/``end`` are ``None`` when ``heard_phones`` is a plain list (no timing).
     """
     _, heard, heard_confidences = _as_recognition(heard_phones)
     words, groups = get_expected_phones(text_reference, lang)
@@ -487,9 +526,13 @@ def compare_phones(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
 
     errors = []
     words_with_errors = []
+    timed_words = []
     for report in _word_reports(heard_phones, text_reference, lang):
         edits, length = report["weighted_edits"], len(report["expected"])
-        if report["distance"] and (edits / length >= PHONE_ERROR_THRESHOLD or edits >= PHONE_ERROR_MIN_EDITS):
+        wrong = bool(report["distance"] and (edits / length >= PHONE_ERROR_THRESHOLD or edits >= PHONE_ERROR_MIN_EDITS))
+        timed_words.append({"position": report["position"], "word": report["word"],
+                            "start": report["start"], "end": report["end"], "correct": not wrong})
+        if wrong:
             errors.append({
                 "position": report["position"],
                 "word": report["word"],
@@ -499,6 +542,8 @@ def compare_phones(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
                 "phone_distance": report["distance"],
                 "confidence": round(min(1.0, max(edits / length, edits / PHONE_ERROR_MIN_EDITS)), 3),
                 "phones": [dict(p, confidence=round(p["confidence"], 3)) for p in report["phones"]],
+                "start": report["start"],
+                "end": report["end"],
             })
             words_with_errors.append(report["word"])
 
@@ -509,4 +554,5 @@ def compare_phones(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
         "phone_error_rate": round(phone_error_rate, 4),
         "errors": errors,
         "words_with_errors": words_with_errors,
+        "words": timed_words,
     }
