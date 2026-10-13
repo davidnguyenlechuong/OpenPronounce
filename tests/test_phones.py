@@ -137,6 +137,140 @@ class TestDecodeWithConfidence(unittest.TestCase):
         self.assertEqual(phones.normalize_phones(["th", "ai5", "ɔːɹ", "ɜː"]), ["t", "aɪ", "oɹ", "ɚ"])
 
 
+class TestWordTimestamps(unittest.TestCase):
+    """Word start/end come from the frames the phones were decoded from."""
+
+    VOCAB = ("<pad>", "h", "aʊ", "u", "z", "t")
+    FRAME = 0.02
+
+    def recognition(self, segments, n_frames):
+        """``segments`` is ``[(token, first_frame, last_frame_inclusive)]`` on a blank background."""
+        lp = np.full((n_frames, len(self.VOCAB)), 1e-6)
+        lp[:, 0] = 0.99
+        for token, first, last in segments:
+            lp[first:last + 1, :] = 1e-6
+            lp[first:last + 1, self.VOCAB.index(token)] = 0.9
+        return phones.decode_ctc(np.log(lp / lp.sum(axis=1, keepdims=True)), self.VOCAB, frame_seconds=self.FRAME)
+
+    def assert_close(self, actual, expected, frames=2):
+        self.assertAlmostEqual(actual, expected, delta=frames * self.FRAME)
+
+    def test_every_word_has_times_within_two_frames(self):
+        # "how" spoken from 0.20 s to 0.30 s, "zoo" from 0.40 s to 0.54 s, 0.70 s of audio in all
+        rec = self.recognition([("h", 10, 11), ("aʊ", 12, 14), ("z", 20, 22), ("u", 23, 26)], 35)
+        result = phones.compare_phones(rec, "how zoo")
+        words = result["words"]
+        self.assertEqual([w["word"] for w in words], ["how", "zoo"])
+        self.assertEqual([w["position"] for w in words], [0, 1])
+        self.assertEqual([w["correct"] for w in words], [True, True])
+        self.assert_close(words[0]["start"], 0.20)
+        self.assert_close(words[0]["end"], 0.30)
+        self.assert_close(words[1]["start"], 0.40)
+        self.assert_close(words[1]["end"], 0.54)
+        self.assertEqual(result["errors"], [])
+
+    def test_wrong_word_carries_times_in_errors_and_words(self):
+        # "zoo" said as "too" (t for z is a full substitution)
+        rec = self.recognition([("h", 10, 11), ("aʊ", 12, 14), ("t", 20, 22), ("u", 23, 26)], 35)
+        result = phones.compare_phones(rec, "how zoo")
+        error = result["errors"][0]
+        self.assertEqual(error["word"], "zoo")
+        self.assert_close(error["start"], 0.40)
+        self.assert_close(error["end"], 0.54)
+        timed = {w["word"]: w for w in result["words"]}
+        self.assertFalse(timed["zoo"]["correct"])
+        self.assertTrue(timed["how"]["correct"])
+        self.assertEqual((timed["zoo"]["start"], timed["zoo"]["end"]), (error["start"], error["end"]))
+
+    def test_unheard_word_gets_the_gap_between_its_neighbours(self):
+        # "how zoo how", the middle word is skipped: gap between the end of 1st how and start of 2nd
+        rec = self.recognition([("h", 10, 11), ("aʊ", 12, 14), ("h", 30, 31), ("aʊ", 32, 34)], 40)
+        words = phones.compare_phones(rec, "how zoo how")["words"]
+        self.assertEqual([w["correct"] for w in words], [True, False, True])
+        self.assert_close(words[1]["start"], 0.30)
+        self.assert_close(words[1]["end"], 0.60)
+
+    def test_plain_list_has_no_times(self):
+        result = phones.compare_phones(["h", "aʊ", "z", "u"], "how zoo")
+        self.assertTrue(all(w["start"] is None and w["end"] is None for w in result["words"]))
+
+    def test_frame_seconds_follows_model_config(self):
+        from unittest.mock import MagicMock, patch
+        model = MagicMock()
+        model.config.inputs_to_logits_ratio = 320
+        with patch.object(phones, "_load_model", return_value=(None, model)):
+            self.assertAlmostEqual(phones.frame_seconds(), 0.02)
+
+    def test_existing_error_fields_are_kept(self):
+        rec = self.recognition([("h", 10, 11), ("u", 12, 14)], 20)
+        error = phones.compare_phones(rec, "how")["errors"][0]
+        for key in ("position", "word", "expected", "actual", "actual_word", "phone_distance", "confidence", "phones"):
+            self.assertIn(key, error)
+
+
+class TestSeverityAndOffsets(unittest.TestCase):
+
+    VOCAB = ("<pad>", "h", "aʊ", "u", "ʊ", "z", "t", "s", "ð", "ə")
+
+    def recognition(self, heard, posterior=0.9):
+        """One frame per heard phone, each with ``posterior``."""
+        # An unsure phone still wins the argmax: the rest of the mass is spread over tokens that are
+        # not phones of the words tested here ("z", "u", "ʊ" stay implausible).
+        lp = np.full((len(heard), len(self.VOCAB)), 1e-6)
+        others = [i for i, tok in enumerate(self.VOCAB) if tok not in ("z", "u", "ʊ")]
+        for t, phone in enumerate(heard):
+            if posterior >= 0.5:
+                lp[t, 0] = 1 - posterior
+            else:
+                lp[t, others] = (1 - posterior) / (len(others) - 1)
+            lp[t, self.VOCAB.index(phone)] = posterior
+        return phones.decode_ctc(np.log(lp / lp.sum(axis=1, keepdims=True)), self.VOCAB)
+
+    def word(self, heard, text, posterior=0.9):
+        return phones.compare_phones(self.recognition(heard, posterior), text)["words"][0]
+
+    def test_confident_wrong_word_is_severe(self):
+        self.assertEqual(self.word(["h", "aʊ"], "zoo")["severity"], "severe")
+
+    def test_one_wrong_phone_in_a_content_word_is_moderate(self):
+        self.assertEqual(self.word(["h", "t"], "how")["severity"], "moderate")
+
+    def test_unsure_recognizer_lowers_severity(self):
+        self.assertEqual(self.word(["h", "aʊ"], "zoo", posterior=0.3)["severity"], "mild")
+
+    def test_function_word_is_never_above_mild(self):
+        self.assertEqual(self.word(["s", "aʊ"], "the")["severity"], "mild")
+
+    def test_only_close_substitutions_are_mild(self):
+        # s for z and ʊ for u: two half errors, flagged (1.0 over 2 phones) but nothing really wrong
+        word = self.word(["s", "ʊ"], "zoo")
+        self.assertFalse(word["correct"])
+        self.assertEqual(word["severity"], "mild")
+
+    def test_correct_word_has_no_severity(self):
+        word = self.word(["h", "aʊ"], "how")
+        self.assertTrue(word["correct"])
+        self.assertEqual(word["severity"], "none")
+
+    def test_errors_carry_severity_and_offsets_like_words(self):
+        result = phones.compare_phones(self.recognition(["h", "aʊ"]), "zoo")
+        error, word = result["errors"][0], result["words"][0]
+        for key in ("severity", "char_start", "char_end"):
+            self.assertEqual(error[key], word[key])
+
+    def test_offsets_point_at_each_word_in_the_original_text(self):
+        text = "How, ZOO!  how"
+        words = phones.compare_phones(["h", "aʊ", "z", "u", "h", "aʊ"], text)["words"]
+        self.assertEqual([(w["char_start"], w["char_end"]) for w in words], [(0, 3), (5, 8), (11, 14)])
+        for w in words:
+            self.assertEqual(text[w["char_start"]:w["char_end"]].lower(), w["word"])
+
+    def test_offsets_with_apostrophe(self):
+        text = "It's how"
+        words = phones.compare_phones(["ɪ", "t", "s", "h", "aʊ"], text)["words"]
+        self.assertEqual(text[words[0]["char_start"]:words[0]["char_end"]], "It's")
+
+
 class TestConfidenceRule(unittest.TestCase):
     """The same wrong phones flag a word or not depending on how sure the recognizer was."""
 

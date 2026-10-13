@@ -398,6 +398,7 @@ def compare_audio_with_text(audio_1, text_reference, sampling_rate=SAMPLING_RATE
             "expected_phones": phone_result["expected_phones"],
             "heard_phones": phone_result["heard_phones"],
             "heard_phones_confidence": phone_result["heard_phones_confidence"],
+            "words": phone_result["words"],
             "feedback": _feedback(phone_result["words_with_errors"]),
         })
 
