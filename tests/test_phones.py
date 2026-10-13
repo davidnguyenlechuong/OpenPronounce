@@ -208,6 +208,69 @@ class TestWordTimestamps(unittest.TestCase):
             self.assertIn(key, error)
 
 
+class TestSeverityAndOffsets(unittest.TestCase):
+
+    VOCAB = ("<pad>", "h", "aʊ", "u", "ʊ", "z", "t", "s", "ð", "ə")
+
+    def recognition(self, heard, posterior=0.9):
+        """One frame per heard phone, each with ``posterior``."""
+        # An unsure phone still wins the argmax: the rest of the mass is spread over tokens that are
+        # not phones of the words tested here ("z", "u", "ʊ" stay implausible).
+        lp = np.full((len(heard), len(self.VOCAB)), 1e-6)
+        others = [i for i, tok in enumerate(self.VOCAB) if tok not in ("z", "u", "ʊ")]
+        for t, phone in enumerate(heard):
+            if posterior >= 0.5:
+                lp[t, 0] = 1 - posterior
+            else:
+                lp[t, others] = (1 - posterior) / (len(others) - 1)
+            lp[t, self.VOCAB.index(phone)] = posterior
+        return phones.decode_ctc(np.log(lp / lp.sum(axis=1, keepdims=True)), self.VOCAB)
+
+    def word(self, heard, text, posterior=0.9):
+        return phones.compare_phones(self.recognition(heard, posterior), text)["words"][0]
+
+    def test_confident_wrong_word_is_severe(self):
+        self.assertEqual(self.word(["h", "aʊ"], "zoo")["severity"], "severe")
+
+    def test_one_wrong_phone_in_a_content_word_is_moderate(self):
+        self.assertEqual(self.word(["h", "t"], "how")["severity"], "moderate")
+
+    def test_unsure_recognizer_lowers_severity(self):
+        self.assertEqual(self.word(["h", "aʊ"], "zoo", posterior=0.3)["severity"], "mild")
+
+    def test_function_word_is_never_above_mild(self):
+        self.assertEqual(self.word(["s", "aʊ"], "the")["severity"], "mild")
+
+    def test_only_close_substitutions_are_mild(self):
+        # s for z and ʊ for u: two half errors, flagged (1.0 over 2 phones) but nothing really wrong
+        word = self.word(["s", "ʊ"], "zoo")
+        self.assertFalse(word["correct"])
+        self.assertEqual(word["severity"], "mild")
+
+    def test_correct_word_has_no_severity(self):
+        word = self.word(["h", "aʊ"], "how")
+        self.assertTrue(word["correct"])
+        self.assertEqual(word["severity"], "none")
+
+    def test_errors_carry_severity_and_offsets_like_words(self):
+        result = phones.compare_phones(self.recognition(["h", "aʊ"]), "zoo")
+        error, word = result["errors"][0], result["words"][0]
+        for key in ("severity", "char_start", "char_end"):
+            self.assertEqual(error[key], word[key])
+
+    def test_offsets_point_at_each_word_in_the_original_text(self):
+        text = "How, ZOO!  how"
+        words = phones.compare_phones(["h", "aʊ", "z", "u", "h", "aʊ"], text)["words"]
+        self.assertEqual([(w["char_start"], w["char_end"]) for w in words], [(0, 3), (5, 8), (11, 14)])
+        for w in words:
+            self.assertEqual(text[w["char_start"]:w["char_end"]].lower(), w["word"])
+
+    def test_offsets_with_apostrophe(self):
+        text = "It's how"
+        words = phones.compare_phones(["ɪ", "t", "s", "h", "aʊ"], text)["words"]
+        self.assertEqual(text[words[0]["char_start"]:words[0]["char_end"]], "It's")
+
+
 class TestConfidenceRule(unittest.TestCase):
     """The same wrong phones flag a word or not depending on how sure the recognizer was."""
 

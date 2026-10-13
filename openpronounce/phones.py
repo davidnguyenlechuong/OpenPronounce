@@ -45,6 +45,13 @@ FINAL_DELETION_COST = 0.5
 # something else is not a confident error (Goodness-of-Pronunciation style); the
 # confidence decreases linearly from 1 (posterior 0) to 0 (posterior at this value).
 PHONE_PLAUSIBLE_POSTERIOR = 0.05
+# Severity of a reported word ("mild" < "moderate" < "severe"): the word confidence is scaled by how
+# sure the recognizer was of what it heard (a peak posterior of HEARD_CONFIDENT or more counts fully),
+# then cut at these two levels. Function words and words with only close substitutions (no phone
+# error above NEAR_PHONE_COST) never go beyond "mild".
+HEARD_CONFIDENT = 0.8
+SEVERITY_MODERATE = 0.5
+SEVERITY_SEVERE = 0.75
 
 # Recognizer tokens that are not phones of any supported language: Mandarin tone
 # numbers, aspiration marks and two-letter spellings of English diphthongs.
@@ -471,8 +478,23 @@ def _word_reports(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
             "weighted_edits": sum(p["confidence"] for p in phone_reports),
             "start": start,
             "end": end,
+            "heard_confidence": max((recognition.confidences[j] for j in matched), default=None)
+            if recognition is not None else None,
         })
     return reports
+
+
+def _severity(report, confidence, lang):
+    """``"mild"``, ``"moderate"`` or ``"severe"`` for a reported word of confidence ``confidence`` (0-1)."""
+    heard = report["heard_confidence"]
+    strength = confidence * min(1.0, (heard if heard is not None else 1.0) / HEARD_CONFIDENT)
+    if report["word"] in ALTERNATE_PRONUNCIATIONS.get(lang, {}):
+        return "mild"
+    if not any(p["confidence"] > NEAR_PHONE_COST for p in report["phones"]):
+        return "mild"
+    if strength >= SEVERITY_SEVERE:
+        return "severe"
+    return "moderate" if strength >= SEVERITY_MODERATE else "mild"
 
 
 def _word_times(recognition, matched, alignment, indices, n_expected):
@@ -513,7 +535,9 @@ def compare_phones(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
     ``actual``, ``actual_word``, plus ``phone_distance``, ``confidence`` (0-1, how sure
     we are the word is mispronounced) and ``phones``, a per-phone list of
     ``{expected, heard, confidence}``, ``start``/``end`` in seconds) and ``words_with_errors``.
-    ``words`` lists every word (correct or not) as ``{position, word, start, end, correct}``;
+    ``words`` lists every word (correct or not) as ``{position, word, char_start, char_end, start, end,
+    correct, severity}`` (``severity`` is ``none``, ``mild``, ``moderate`` or ``severe``; ``char_start``/
+    ``char_end`` are code point offsets of the word in ``text_reference``, errors carry them too);
     ``start``/``end`` are ``None`` when ``heard_phones`` is a plain list (no timing).
     """
     _, heard, heard_confidences = _as_recognition(heard_phones)
@@ -527,11 +551,17 @@ def compare_phones(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
     errors = []
     words_with_errors = []
     timed_words = []
+    offsets = [m.span() for m in _WORD_RE.finditer(text_reference)]
     for report in _word_reports(heard_phones, text_reference, lang):
         edits, length = report["weighted_edits"], len(report["expected"])
         wrong = bool(report["distance"] and (edits / length >= PHONE_ERROR_THRESHOLD or edits >= PHONE_ERROR_MIN_EDITS))
+        confidence = round(min(1.0, max(edits / length, edits / PHONE_ERROR_MIN_EDITS)), 3) if wrong else 0.0
+        severity = _severity(report, confidence, lang) if wrong else "none"
+        char_start, char_end = offsets[report["position"]]
         timed_words.append({"position": report["position"], "word": report["word"],
-                            "start": report["start"], "end": report["end"], "correct": not wrong})
+                            "char_start": char_start, "char_end": char_end,
+                            "start": report["start"], "end": report["end"],
+                            "correct": not wrong, "severity": severity})
         if wrong:
             errors.append({
                 "position": report["position"],
@@ -540,7 +570,10 @@ def compare_phones(heard_phones, text_reference, lang=DEFAULT_LANGUAGE):
                 "actual": "".join(report["actual"]),
                 "actual_word": "",
                 "phone_distance": report["distance"],
-                "confidence": round(min(1.0, max(edits / length, edits / PHONE_ERROR_MIN_EDITS)), 3),
+                "confidence": confidence,
+                "severity": severity,
+                "char_start": char_start,
+                "char_end": char_end,
                 "phones": [dict(p, confidence=round(p["confidence"], 3)) for p in report["phones"]],
                 "start": report["start"],
                 "end": report["end"],
